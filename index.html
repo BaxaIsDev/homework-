@@ -91,4 +91,344 @@ footer{text-align:center;color:#aaa;font-size:11px;margin-top:35px}
   <input id="adminPassword" type="password" autocomplete="current-password" placeholder="Administrator password">
 
   <div class="actions">
-    <button class="btn" id="unlock">Sign in</
+    <button class="btn" id="unlock">Sign in</button>
+  </div>
+  <p class="notice" id="authStatus">Only your Firebase administrator account can publish messages.</p>
+</section>
+
+<section class="admin hidden" id="adminForm">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+    <h3>Post a homework message</h3>
+    <button class="btn light" id="lock">Lock</button>
+  </div>
+
+  <label class="field" for="messageDate">MESSAGE DATE (DAY / MONTH / YEAR)</label>
+  <input id="messageDate" type="date">
+
+  <label class="field" for="messageText">TEACHER'S MESSAGE</label>
+  <textarea id="messageText" placeholder="Paste the full teacher's homework message here…"></textarea>
+
+  <div class="actions">
+    <button class="btn" id="post">Publish message</button>
+  </div>
+
+  <p class="notice">Messages older than 5 days are automatically hidden. Messages from the same date appear together in one rectangle.</p>
+
+  <hr style="border:0;border-top:1px solid #383838;margin:22px 0">
+
+  <h3 style="margin:0 0 5px">Telegram bot connection</h3>
+  <p class="muted" style="margin:0">Telegram syncing is not enabled in this static website. Do not enter a bot token here.</p>
+
+  <label class="field" for="telegramBotToken">TELEGRAM BOT TOKEN</label>
+  <input id="telegramBotToken" type="password" autocomplete="off" placeholder="Paste bot token here">
+
+  <label class="field" for="telegramChatId">TELEGRAM CHAT / GROUP ID</label>
+  <input id="telegramChatId" type="text" placeholder="e.g. -1001234567890">
+
+  <div class="actions">
+    <button class="btn light" id="saveTelegram">Save connection details</button>
+  </div>
+
+  <p class="notice" id="telegramStatus">Automatic Telegram syncing needs a secure server/webhook. Do not paste a real bot token into a public website; this demo does not activate syncing.</p>
+</section>
+
+<footer>HOMEWORK · GRADE 9</footer>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+
+<script>
+const firebaseConfig = {
+  apiKey: "AIzaSyDLDSx2OHQSoPQRq6bfAADpOr5vD4QxPt4",
+  authDomain: "homework-cf688.firebaseapp.com",
+  projectId: "homework-cf688",
+  storageBucket: "homework-cf688.firebasestorage.app",
+  messagingSenderId: "437324947951",
+  appId: "1:437324947951:web:34d2a68899dba99550d61a"
+};
+
+const $ = id => document.getElementById(id);
+
+let messages = [];
+let signedInUser = null;
+let db = null;
+let auth = null;
+
+function localDateInput() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function localDateInputFor(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function dateValue(m) {
+  const d = new Date(m.date);
+  return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
+function dayKey(m) {
+  if (typeof m.dateKey === "string" && /^\d{4}-\d{2}-\d{2}$/.test(m.dateKey)) {
+    return m.dateKey;
+  }
+
+  const d = new Date(m.date);
+  return Number.isNaN(d.getTime())
+    ? "Unknown date"
+    : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+function todayKey() {
+  return localDateInput();
+}
+
+function recentMessages() {
+  const today = todayKey();
+  const cutoffDate = new Date();
+  cutoffDate.setHours(12,0,0,0);
+  cutoffDate.setDate(cutoffDate.getDate()-4);
+  const cutoff = localDateInputFor(cutoffDate);
+
+  return messages
+    .filter(m => {
+      const k = dayKey(m);
+      return k !== "Unknown date" && k >= cutoff && k <= today;
+    })
+    .sort((a,b) => dayKey(b).localeCompare(dayKey(a)) || dateValue(b)-dateValue(a));
+}
+
+function dayLabel(key) {
+  const [y,mo,da] = key.split("-").map(Number);
+  return new Date(y,mo-1,da,12).toLocaleDateString("en-GB", {
+    day:"2-digit",
+    month:"long",
+    year:"numeric"
+  });
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;",
+    "<":"&lt;",
+    ">":"&gt;",
+    '"':"&quot;",
+    "'":"&#39;"
+  }[c]));
+}
+
+function render() {
+  const list = recentMessages();
+  const todayCount = list.filter(m => dayKey(m) === todayKey()).length;
+
+  $("homeworkCount").textContent = todayCount;
+
+  if (!list.length) {
+    $("messageList").innerHTML =
+      '<div class="empty">No homework messages for today yet.</div>';
+    return;
+  }
+
+  const canDelete = !!(signedInUser && !signedInUser.isAnonymous);
+  const groups = {};
+
+  for (const m of list) {
+    const k = dayKey(m);
+    (groups[k] ??= []).push(m);
+  }
+
+  $("messageList").innerHTML = Object.entries(groups).map(([day,items]) =>
+    `<section class="day-group">
+      <div class="day-heading">${esc(dayLabel(day))}</div>
+      ${items.map((m,i) =>
+        `<article class="day-message">
+          <div class="message-top">
+            <div class="message-number">MESSAGE ${String(i+1).padStart(2,"0")}</div>
+            ${canDelete ? `<button class="delete-btn" type="button" data-delete-id="${esc(m.id)}">Delete</button>` : ""}
+          </div>
+          <div class="body">${esc(m.text)}</div>
+        </article>`
+      ).join("")}
+    </section>`
+  ).join("");
+}
+
+function admin(on) {
+  $("adminGate").classList.toggle("hidden",on);
+  $("adminForm").classList.toggle("hidden",!on);
+}
+
+function setStatus(message) {
+  $("authStatus").textContent = message;
+}
+
+try {
+  firebase.initializeApp(firebaseConfig);
+  auth = firebase.auth();
+  db = firebase.firestore();
+
+  db.collection("messages").onSnapshot(snapshot => {
+    messages = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+    render();
+  }, error => {
+    console.error(error);
+    $("messageList").innerHTML =
+      '<div class="empty">Could not load messages. Check your Firebase configuration and Firestore rules.</div>';
+  });
+
+  auth.onAuthStateChanged(user => {
+    signedInUser = user;
+
+    if (user && !user.isAnonymous) {
+      admin(true);
+      setStatus("Signed in as administrator.");
+    } else {
+      admin(false);
+      setStatus("Sign in with your Firebase administrator email and password to post.");
+    }
+
+    render();
+  });
+
+} catch (error) {
+  console.error(error);
+  $("messageList").innerHTML =
+    '<div class="empty">Could not connect to Firebase. Check internet access and Firebase settings.</div>';
+  setStatus(error.message);
+}
+
+$("unlock").onclick = async () => {
+  if (!auth) {
+    setStatus("Firebase configuration failed to load.");
+    return;
+  }
+
+  const email = $("adminEmail").value.trim();
+  const password = $("adminPassword").value;
+
+  if (!email || !password) {
+    setStatus("Enter your administrator email and password.");
+    return;
+  }
+
+  try {
+    setStatus("Signing in…");
+    await auth.signInWithEmailAndPassword(email,password);
+    $("adminPassword").value = "";
+  } catch (error) {
+    console.error(error);
+    setStatus("Sign-in failed: " + (error.code || error.message));
+  }
+};
+
+$("lock").onclick = async () => {
+  if (auth) await auth.signOut();
+  admin(false);
+};
+
+$("messageList").addEventListener("click", async event => {
+  const button = event.target.closest("[data-delete-id]");
+  if (!button) return;
+
+  if (!signedInUser || signedInUser.isAnonymous) {
+    alert("Sign in with the administrator account first.");
+    return;
+  }
+
+  const id = button.dataset.deleteId;
+
+  if (!confirm("Delete this homework message for everyone? This cannot be undone.")) {
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "Deleting…";
+
+  try {
+    await db.collection("messages").doc(id).delete();
+  } catch (error) {
+    console.error(error);
+    button.disabled = false;
+    button.textContent = "Delete";
+    alert("Could not delete: " + (error.code || error.message) +
+      ". Check the administrator UID in Firestore Rules.");
+  }
+});
+
+$("post").onclick = async () => {
+  if (!signedInUser || signedInUser.isAnonymous) {
+    admin(false);
+    alert("Sign in with the administrator account first.");
+    return;
+  }
+
+  const text = $("messageText").value.trim();
+  const date = $("messageDate").value;
+
+  if (!text) {
+    alert("Paste the teacher's message first.");
+    return;
+  }
+
+  if (!date) {
+    alert("Choose the message date.");
+    return;
+  }
+
+  const parts = date.split("-").map(Number);
+  const d = new Date(parts[0],parts[1]-1,parts[2],12,0,0);
+
+  if (localDateInputFor(d) > todayKey()) {
+    alert("Message date cannot be in the future.");
+    return;
+  }
+
+  try {
+    await db.collection("messages").add({
+      date: d.toISOString(),
+      dateKey: date,
+      text,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      authorUid: signedInUser.uid
+    });
+
+    $("messageText").value = "";
+    alert("Homework message published and synced.");
+  } catch (error) {
+    console.error(error);
+    alert("Could not publish: " + (error.code || error.message) +
+      ". Check the administrator UID in Firestore Rules.");
+  }
+};
+
+$("saveTelegram").onclick = () => {
+  const chat = $("telegramChatId").value.trim();
+
+  if (!chat) {
+    $("telegramStatus").textContent =
+      "Enter a chat ID. Automatic syncing still requires a secure backend.";
+    return;
+  }
+
+  localStorage.setItem("hw_telegram_chat_id",chat);
+  $("telegramBotToken").value = "";
+
+  $("telegramStatus").textContent =
+    "Chat ID saved on this device. Automatic Telegram syncing is not enabled.";
+  alert("Demo settings saved on this device. Automatic syncing is not enabled.");
+};
+
+$("telegramChatId").value =
+  localStorage.getItem("hw_telegram_chat_id") || "";
+
+$("messageDate").value = localDateInput();
+
+render();
+</script>
+</body>
+</html>
